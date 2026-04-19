@@ -3,6 +3,8 @@ import pandas as pd
 from dotenv import load_dotenv
 from anthropic import Anthropic
 from stats.tests import two_sample_test
+from stats.diagnostics import srm_check
+
 
 load_dotenv()  # <-- must come BEFORE Anthropic() so the key is in env
 client = Anthropic()
@@ -45,11 +47,41 @@ TOOLS = [
             },
             "required": ["metric", "group_col", "metric_type"],
         },
-    }
+    },
+    {
+        "name": "srm_check",
+        "description": (
+            "Check for Sample Ratio Mismatch (SRM) in an A/B experiment. "
+            "Runs a chi-square goodness-of-fit test on group sizes against "
+            "an expected split (default 50/50). A significant result means "
+            "randomization is likely broken -- downstream test results "
+            "should NOT be trusted until the root cause is found. "
+            "ALWAYS call this BEFORE interpreting any two_sample_test result."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "group_col": {
+                    "type": "string",
+                    "description": "Column labelling the experiment groups.",
+                },
+                "expected_split": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": (
+                        "Expected group proportions, e.g. [0.5, 0.5] for a "
+                        "balanced experiment. Omit for equal split."
+                    ),
+                },
+            },
+            "required": ["group_col"],
+        },
+    },
 ]
 
 TOOL_REGISTRY = {
     "two_sample_test": two_sample_test,
+    "srm_check": srm_check,
 }
 
 SYSTEM_PROMPT = """You are a statistical copilot for A/B testing analysis.
@@ -58,8 +90,20 @@ You have access to tools that run rigorous statistical tests. You NEVER
 compute p-values, confidence intervals, or effect sizes yourself -- you
 ALWAYS call the appropriate tool.
 
-When you get the tool result back, write a short plain-English summary that
-a non-technical product manager would understand. Always include:
+WORKFLOW:
+Before interpreting any two_sample_test result, you MUST first call
+srm_check to verify that randomization is not broken. The srm_check
+tool returns a status ("PASSED" or "FAILED") and a verdict string.
+Quote the verdict faithfully.
+
+- If status is "PASSED", simply mention that the randomization check
+  passed and move on to the primary analysis. Do not add caveats.
+- If status is "FAILED", flag the issue prominently and recommend
+  investigating before trusting the primary test.
+
+When you get the two_sample_test result back, write a short
+plain-English summary that a non-technical product manager would
+understand. Always include:
 - the direction and size of the effect (in percentage points for binary metrics)
 - whether it is statistically significant, and why (cite the p-value and CI)
 - a clear recommendation (ship / don't ship / inconclusive)
@@ -67,7 +111,6 @@ a non-technical product manager would understand. Always include:
 Dataset columns: {columns}
 Column dtypes: {dtypes}
 """
-
 
 def answer_question(df: pd.DataFrame, question: str, max_hops: int = 5) -> dict:
     """Run a multi-turn function-calling loop until Claude gives a final answer."""
@@ -110,4 +153,16 @@ def answer_question(df: pd.DataFrame, question: str, max_hops: int = 5) -> dict:
                 })
         messages.append({"role": "user", "content": tool_results})
 
-    return {"answer": "Hit max tool-call limit.", "tool_calls": tool_calls}
+    return {
+        "check_name": "Sample Ratio Mismatch",
+        "status": "FAILED" if srm_detected else "PASSED",
+        "verdict": (
+            "SRM DETECTED -- randomization may be broken; do NOT trust "
+            "downstream test results until root cause is identified."
+            if srm_detected
+            else "Randomization check passed. Group sizes are consistent "
+            "with the expected split. Safe to proceed with primary analysis."
+        ),
+        "groups": [str(g) for g in groups],
+        "observed_counts": [int(c) for c in observed],
+    }

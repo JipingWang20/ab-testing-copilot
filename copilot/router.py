@@ -3,7 +3,7 @@ import pandas as pd
 from dotenv import load_dotenv
 from anthropic import Anthropic
 from stats.tests import two_sample_test
-from stats.diagnostics import srm_check
+from stats.diagnostics import srm_check, cuped_check
 
 
 load_dotenv()  # <-- must come BEFORE Anthropic() so the key is in env
@@ -17,8 +17,11 @@ TOOLS = [
         "description": (
             "Test whether a metric differs significantly between two groups in "
             "an A/B experiment. Automatically picks Welch's t-test for continuous "
-            "metrics and two-proportion z-test for binary metrics. Returns effect "
-            "size, p-value, 95% confidence interval, and significance flag."
+            "metrics and two-proportion z-test for binary metrics. "
+            "Optionally applies CUPED variance reduction (continuous metrics only) "
+            "when a pre-experiment covariate is supplied via use_cuped=True. "
+            "Returns effect size, p-value, 95% confidence interval, significance "
+            "flag, and -- when CUPED is applied -- the achieved variance reduction."
         ),
         "input_schema": {
             "type": "object",
@@ -43,6 +46,22 @@ TOOLS = [
                 "alpha": {
                     "type": "number",
                     "description": "Significance level. Default 0.05.",
+                },
+                "use_cuped": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, apply CUPED variance reduction using the named "
+                        "covariate before testing. Only valid for continuous metrics. "
+                        "Set this based on the verdict returned by cuped_check -- do "
+                        "NOT decide on your own."
+                    ),
+                },
+                "covariate": {
+                    "type": "string",
+                    "description": (
+                        "Column name of the pre-experiment covariate to use for "
+                        "CUPED. Required when use_cuped is true."
+                    ),
                 },
             },
             "required": ["metric", "group_col", "metric_type"],
@@ -77,11 +96,46 @@ TOOLS = [
             "required": ["group_col"],
         },
     },
+    {
+        "name": "cuped_check",
+        "description": (
+            "Pre-flight check for CUPED variance reduction. Decides whether a "
+            "candidate pre-experiment covariate is suitable for CUPED by "
+            "verifying (1) the covariate is balanced across arms (no leakage / "
+            "post-treatment contamination), and (2) it is correlated enough with "
+            "the outcome to be worth using. Returns one of three statuses: "
+            "'APPLY' (use CUPED), 'SKIP' (covariate too weak), or 'BLOCKED' "
+            "(covariate fails balance check). Call AFTER srm_check passes, and "
+            "ONLY for continuous metrics with a plausible pre-experiment covariate."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "metric": {
+                    "type": "string",
+                    "description": "Column name of the outcome metric.",
+                },
+                "group_col": {
+                    "type": "string",
+                    "description": "Column labelling the experiment groups.",
+                },
+                "covariate": {
+                    "type": "string",
+                    "description": (
+                        "Column name of the candidate pre-experiment covariate "
+                        "(e.g. 'pre_revenue', 'baseline_value')."
+                    ),
+                },
+            },
+            "required": ["metric", "group_col", "covariate"],
+        },
+    },
 ]
 
 TOOL_REGISTRY = {
     "two_sample_test": two_sample_test,
     "srm_check": srm_check,
+    "cuped_check": cuped_check,
 }
 
 SYSTEM_PROMPT = """You are a statistical copilot for A/B testing analysis.
@@ -91,28 +145,64 @@ compute p-values, confidence intervals, or effect sizes yourself -- you
 ALWAYS call the appropriate tool.
 
 WORKFLOW:
-Before interpreting any two_sample_test result, you MUST first call
-srm_check to verify that randomization is not broken. The srm_check
-tool returns a status ("PASSED" or "FAILED") and a verdict string.
-Quote the verdict faithfully.
 
-- If status is "PASSED", simply mention that the randomization check
-  passed and move on to the primary analysis. Do not add caveats.
+(1) Randomization check. Before interpreting any two_sample_test result,
+you MUST first call srm_check to verify that randomization is not broken.
+The srm_check tool returns a status ("PASSED" or "FAILED") and a verdict
+string. Quote the verdict faithfully.
+- If status is "PASSED", briefly mention that the randomization check
+  passed and move on. Do not add caveats.
 - If status is "FAILED", flag the issue prominently and recommend
   investigating before trusting the primary test.
 
-When you get the two_sample_test result back, write a short
+(2) CUPED pre-flight (continuous metrics only). After srm_check passes,
+if the dataset contains a column whose name suggests it was captured
+BEFORE the experiment started (e.g., starts with "pre_", "baseline_",
+or contains "_pre"), AND the primary metric is continuous, you MUST call
+cuped_check with that column as the covariate. The cuped_check tool
+returns a status:
+- "APPLY"   : the covariate is suitable. Call two_sample_test with
+              use_cuped=True and the same covariate.
+- "SKIP"    : the covariate is too weakly correlated with the outcome.
+              Call two_sample_test normally (use_cuped=False).
+- "BLOCKED" : the covariate fails the balance check (likely leakage or
+              broken randomization on that covariate). Surface the
+              verdict prominently and do NOT use CUPED.
+Quote the verdict faithfully. Do not second-guess it.
+
+For binary metrics, skip cuped_check entirely -- CUPED is not supported
+for proportions in this tool.
+
+(3) Primary test. Call two_sample_test with use_cuped set according to
+the cuped_check verdict above. The returned p-value, CI, and effect size
+already reflect the CUPED adjustment when use_cuped=True -- use them
+directly. Never recompute or sanity-check them.
+
+(4) Summary. When you get the two_sample_test result back, write a short
 plain-English summary that a non-technical product manager would
 understand. Always include:
-- the direction and size of the effect (in percentage points for binary metrics)
-- whether it is statistically significant, and why (cite the p-value and CI)
+- the direction and size of the effect (in percentage points for binary
+  metrics)
+- whether it is statistically significant, and why (cite the p-value
+  and CI)
 - a clear recommendation (ship / don't ship / inconclusive)
+- if CUPED was applied, one sentence noting it and the reported
+  variance reduction (e.g., "Variance reduced 34% via CUPED using
+  pre-period revenue."). Do not explain the math unless asked.
+- if CUPED was considered but skipped or blocked, one brief sentence
+  saying so.
+
+HARD RULES:
+- Never compute, estimate, or re-derive any statistic from raw inputs.
+- Never override a tool's verdict by reasoning independently.
+- If two tools return conflicting signals, surface the conflict
+  explicitly rather than silently picking one.
 
 Dataset columns: {columns}
 Column dtypes: {dtypes}
 """
 
-def answer_question(df: pd.DataFrame, question: str, max_hops: int = 5) -> dict:
+def answer_question(df: pd.DataFrame, question: str, max_hops: int = 6) -> dict:
     """Run a multi-turn function-calling loop until Claude gives a final answer."""
     system = SYSTEM_PROMPT.format(
         columns=list(df.columns),
@@ -153,16 +243,13 @@ def answer_question(df: pd.DataFrame, question: str, max_hops: int = 5) -> dict:
                 })
         messages.append({"role": "user", "content": tool_results})
 
+    # ---- hop budget exhausted ----
     return {
-        "check_name": "Sample Ratio Mismatch",
-        "status": "FAILED" if srm_detected else "PASSED",
-        "verdict": (
-            "SRM DETECTED -- randomization may be broken; do NOT trust "
-            "downstream test results until root cause is identified."
-            if srm_detected
-            else "Randomization check passed. Group sizes are consistent "
-            "with the expected split. Safe to proceed with primary analysis."
+        "answer": (
+            f"Reached the maximum of {max_hops} tool-calling hops without a "
+            "final answer. This usually means the question requires more "
+            "diagnostic steps than the budget allows, or the model is "
+            "looping. Inspect tool_calls for what was attempted."
         ),
-        "groups": [str(g) for g in groups],
-        "observed_counts": [int(c) for c in observed],
+        "tool_calls": tool_calls,
     }

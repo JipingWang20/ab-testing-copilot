@@ -5,6 +5,7 @@ from anthropic import Anthropic
 from stats.tests import two_sample_test
 from stats.diagnostics import srm_check, cuped_check
 from stats.power import power_analysis
+from stats.corrections import multiple_comparisons_correction
 
 
 load_dotenv()  # <-- must come BEFORE Anthropic() so the key is in env
@@ -17,39 +18,29 @@ TOOLS = [
         "name": "two_sample_test",
         "description": (
             "Test whether a metric differs significantly between two groups in "
-            "an A/B experiment. Automatically picks Welch's t-test for continuous "
-            "metrics and two-proportion z-test for binary metrics. "
-            "Optionally applies CUPED variance reduction (continuous metrics only) "
-            "when a pre-experiment covariate is supplied via use_cuped=True. "
-            "Returns effect size, p-value, 95% confidence interval, significance "
-            "flag, and -- when CUPED is applied -- the achieved variance reduction. "
-            "Use this for ANALYSIS of completed experiments."
+            "an A/B experiment. Welch's t-test for continuous metrics; two-"
+            "proportion z-test for binary metrics. Optionally applies CUPED "
+            "variance reduction (continuous only) when use_cuped=True. Use for "
+            "ANALYSIS of completed experiments."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "metric": {"type": "string", "description": "Column name of the metric to test."},
-                "group_col": {"type": "string", "description": "Column labelling the two groups."},
+                "metric": {"type": "string", "description": "Metric column."},
+                "group_col": {"type": "string", "description": "Group column."},
                 "metric_type": {
                     "type": "string",
                     "enum": ["continuous", "binary"],
-                    "description": (
-                        "'binary' for 0/1 or True/False outcomes like retention or "
-                        "conversion. 'continuous' for counts or real-valued metrics."
-                    ),
+                    "description": "'binary' for 0/1 outcomes; 'continuous' for real-valued.",
                 },
                 "alpha": {"type": "number", "description": "Significance level. Default 0.05."},
                 "use_cuped": {
                     "type": "boolean",
-                    "description": (
-                        "If true, apply CUPED variance reduction using the named "
-                        "covariate before testing. Only valid for continuous metrics. "
-                        "Set this based on the verdict returned by cuped_check."
-                    ),
+                    "description": "Apply CUPED. Set per the cuped_check verdict.",
                 },
                 "covariate": {
                     "type": "string",
-                    "description": "Column name of the pre-experiment covariate for CUPED.",
+                    "description": "Pre-experiment covariate column for CUPED.",
                 },
             },
             "required": ["metric", "group_col", "metric_type"],
@@ -58,20 +49,18 @@ TOOLS = [
     {
         "name": "srm_check",
         "description": (
-            "Check for Sample Ratio Mismatch (SRM). Runs a chi-square goodness-of-fit "
-            "test on group sizes against an expected split. A significant result means "
-            "randomization is likely broken -- downstream tests should NOT be trusted. "
-            "ALWAYS call this BEFORE interpreting any two_sample_test result. "
-            "Do NOT call for planning questions about future experiments."
+            "Sample Ratio Mismatch check. Chi-square on group sizes vs expected "
+            "split. ALWAYS call BEFORE interpreting any two_sample_test result. "
+            "Do NOT call for planning questions."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "group_col": {"type": "string", "description": "Column labelling the groups."},
+                "group_col": {"type": "string", "description": "Group column."},
                 "expected_split": {
                     "type": "array",
                     "items": {"type": "number"},
-                    "description": "Expected proportions, e.g. [0.5, 0.5]. Omit for equal split.",
+                    "description": "Expected proportions. Omit for equal split.",
                 },
             },
             "required": ["group_col"],
@@ -80,21 +69,16 @@ TOOLS = [
     {
         "name": "cuped_check",
         "description": (
-            "Pre-flight check for CUPED variance reduction. Verifies (1) the covariate "
-            "is balanced across arms (no leakage), and (2) it is correlated enough with "
-            "the outcome. Returns status 'APPLY', 'SKIP', or 'BLOCKED'. Call AFTER "
-            "srm_check passes, and ONLY for continuous metrics with a plausible "
+            "CUPED pre-flight. Returns APPLY / SKIP / BLOCKED. Call AFTER "
+            "srm_check passes, ONLY for continuous metrics with a plausible "
             "pre-experiment covariate. Do NOT call for planning questions."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "metric": {"type": "string", "description": "Outcome metric column."},
+                "metric": {"type": "string", "description": "Outcome metric."},
                 "group_col": {"type": "string", "description": "Group column."},
-                "covariate": {
-                    "type": "string",
-                    "description": "Candidate pre-experiment covariate column.",
-                },
+                "covariate": {"type": "string", "description": "Candidate covariate."},
             },
             "required": ["metric", "group_col", "covariate"],
         },
@@ -102,16 +86,11 @@ TOOLS = [
     {
         "name": "power_analysis",
         "description": (
-            "Power analysis for experiment PLANNING (before the experiment runs). "
-            "Solves the four-way relationship between sample size per arm (n), "
-            "minimum detectable effect (mde), significance level (alpha), and power. "
-            "Specify three of the four; the function solves for the remaining one via "
-            "solve_for. Use this when the user asks how many users they need, what "
-            "effect they could detect with a given sample, or whether a planned "
-            "experiment is adequately powered. Do NOT use this for analyzing experiments "
-            "that have already completed -- use two_sample_test for that. For continuous "
-            "metrics, pass either baseline_std (a number) or baseline_column (a column "
-            "name to compute std from). For binary metrics, pass baseline_rate."
+            "Power analysis for experiment PLANNING. Solves the n / mde / power / "
+            "alpha relationship -- specify three, solve for the fourth via "
+            "solve_for. Use when the user asks how many users they need, what "
+            "effect they could detect with N users, or whether a plan is "
+            "well-powered. Do NOT use for analyzing completed experiments."
         ),
         "input_schema": {
             "type": "object",
@@ -119,47 +98,70 @@ TOOLS = [
                 "metric_type": {
                     "type": "string",
                     "enum": ["continuous", "binary"],
-                    "description": (
-                        "'continuous' for real-valued metrics like revenue. "
-                        "'binary' for 0/1 outcomes like conversion or retention."
-                    ),
+                    "description": "'continuous' or 'binary'.",
                 },
                 "solve_for": {
                     "type": "string",
                     "enum": ["n", "mde", "power"],
-                    "description": (
-                        "'n' = solve for required sample size per arm. "
-                        "'mde' = solve for smallest detectable effect given fixed n. "
-                        "'power' = solve for achieved power given fixed n and mde."
-                    ),
+                    "description": "Which quantity to solve for.",
                 },
-                "baseline_std": {
-                    "type": "number",
-                    "description": "Per-user std for continuous metrics. Use this OR baseline_column.",
-                },
+                "baseline_std": {"type": "number", "description": "Per-user std (continuous)."},
                 "baseline_column": {
                     "type": "string",
-                    "description": (
-                        "Column name to compute std from (e.g. a pre-period revenue column). "
-                        "Alternative to baseline_std."
-                    ),
+                    "description": "Column to compute std from. Alternative to baseline_std.",
                 },
-                "baseline_rate": {
-                    "type": "number",
-                    "description": "Baseline conversion rate in (0, 1) for binary metrics.",
-                },
-                "mde": {
-                    "type": "number",
-                    "description": (
-                        "Minimum detectable effect. Continuous: in metric units (e.g. 1.0 "
-                        "means $1 lift). Binary: absolute percentage points (e.g. 0.02 means +2pp)."
-                    ),
-                },
+                "baseline_rate": {"type": "number", "description": "Conversion rate (binary)."},
+                "mde": {"type": "number", "description": "Minimum detectable effect."},
                 "n_per_arm": {"type": "integer", "description": "Sample size per arm."},
                 "alpha": {"type": "number", "description": "Significance level. Default 0.05."},
                 "power": {"type": "number", "description": "Target power. Default 0.80."},
             },
             "required": ["metric_type", "solve_for"],
+        },
+    },
+    {
+        "name": "multiple_comparisons_correction",
+        "description": (
+            "Adjust for multiple-hypothesis testing. When more than one "
+            "two_sample_test has been run on the same experiment (multiple "
+            "metrics, multiple variants, or both), the chance of at least one "
+            "false positive grows with the number of tests. Call this AFTER "
+            "all two_sample_test calls in an analysis, BEFORE writing the "
+            "final summary. Default method 'bh' (Benjamini-Hochberg, controls "
+            "false discovery rate) is right for tech experimentation; "
+            "'bonferroni' is more conservative (controls family-wise error "
+            "rate) and used for clinical or safety-critical decisions. The "
+            "final summary should report ADJUSTED significance, not raw."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "tests": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "metric": {"type": "string"},
+                            "p_value": {"type": "number"},
+                        },
+                        "required": ["metric", "p_value"],
+                    },
+                    "description": (
+                        "List of {metric, p_value} pairs from all "
+                        "two_sample_test calls in this analysis."
+                    ),
+                },
+                "method": {
+                    "type": "string",
+                    "enum": ["bh", "bonferroni"],
+                    "description": "Correction method. Default 'bh'.",
+                },
+                "alpha": {
+                    "type": "number",
+                    "description": "FDR target or family-wise alpha. Default 0.05.",
+                },
+            },
+            "required": ["tests"],
         },
     },
 ]
@@ -169,6 +171,7 @@ TOOL_REGISTRY = {
     "srm_check": srm_check,
     "cuped_check": cuped_check,
     "power_analysis": power_analysis,
+    "multiple_comparisons_correction": multiple_comparisons_correction,
 }
 
 SYSTEM_PROMPT = """You are a statistical copilot for A/B testing.
@@ -180,64 +183,70 @@ sizes yourself -- you ALWAYS call the appropriate tool.
 First, identify whether the user is asking about:
 
 (A) ANALYSIS of an experiment that already happened (e.g. "did the
-    treatment lift revenue?", "is this difference significant?"). Use
-    the ANALYSIS WORKFLOW below.
+    treatment lift revenue?", "is this difference significant?", "did
+    retention and revenue both improve?"). Use the ANALYSIS WORKFLOW.
 
 (B) PLANNING a future experiment (e.g. "how many users do I need?",
-    "what effect could I detect with 5000 users per arm?", "is my
-    planned experiment well-powered?"). Use the PLANNING WORKFLOW below.
+    "what effect could I detect with 5000 users per arm?"). Use the
+    PLANNING WORKFLOW.
 
 ==================== ANALYSIS WORKFLOW ====================
 
 (1) Randomization check. Before interpreting any two_sample_test result,
 you MUST first call srm_check. Quote the verdict faithfully.
-- If "PASSED", briefly mention it and move on. Do not add caveats.
-- If "FAILED", flag prominently and recommend investigating.
+- "PASSED": mention briefly and move on. No caveats.
+- "FAILED": flag prominently and recommend investigating.
 
 (2) CUPED pre-flight (continuous metrics only). After srm_check passes,
 if the dataset contains a column whose name suggests pre-experiment
 capture (starts with "pre_", "baseline_", or contains "_pre"), AND the
-primary metric is continuous, you MUST call cuped_check with that column
-as the covariate. Honor the verdict:
-- "APPLY"   -> two_sample_test with use_cuped=True and same covariate.
-- "SKIP"    -> two_sample_test with use_cuped=False.
-- "BLOCKED" -> surface verdict prominently, do NOT use CUPED.
+metric is continuous, you MUST call cuped_check. Honor the verdict:
+- APPLY   -> two_sample_test with use_cuped=True and the covariate.
+- SKIP    -> two_sample_test with use_cuped=False.
+- BLOCKED -> surface verdict prominently, do NOT use CUPED.
+Skip cuped_check entirely for binary metrics.
 
-For binary metrics, skip cuped_check entirely.
+(3) Primary test(s). Call two_sample_test for each metric the user
+asked about. If the question mentions multiple metrics ("did retention
+AND revenue improve?"), or compares multiple variants, run two_sample_test
+once per metric/variant.
 
-(3) Primary test. Call two_sample_test with use_cuped per the verdict.
-The returned p-value, CI, and effect already reflect any CUPED
-adjustment -- use them directly.
+(4) Multiple-comparisons correction (REQUIRED if more than one
+two_sample_test was called in this analysis). After ALL two_sample_test
+calls, call multiple_comparisons_correction with the list of
+{{metric, p_value}} pairs. Use method='bh' by default (FDR control,
+appropriate for tech). Use 'bonferroni' only if the user explicitly
+asks for family-wise error control, or the context is clinical/safety
+critical. In the final summary, report ADJUSTED significance, not raw.
+If a metric loses significance under correction, say so explicitly.
 
-(4) Summary. Plain-English PM-style summary. Always include:
+(5) Summary. Plain-English PM-style summary. Always include:
 - effect direction and size (pp for binary metrics)
-- significance, with p-value and CI cited
+- significance (after correction, if applicable), citing p-value/p_adj and CI
 - clear recommendation (ship / don't ship / inconclusive)
 - one sentence on CUPED if applied (and the variance reduction)
+- one sentence on correction if applied (which method, what it changed)
 
 ==================== PLANNING WORKFLOW ====================
 
-Call power_analysis. Do NOT call srm_check or cuped_check for planning
-questions -- those are for completed experiments only.
+Call power_analysis. Do NOT call srm_check, cuped_check, or
+multiple_comparisons_correction for planning questions -- those are for
+completed experiments only.
 
 Picking inputs:
-- metric_type: infer from context ("revenue" -> continuous;
-  "conversion" / "retention" -> binary).
-- solve_for: "n" for "how many users?", "mde" for "what effect could
-  I detect with N users?", "power" for "is this plan well-powered?".
-- For continuous: pass baseline_column if the dataset has a relevant
-  pre-period or historical column; otherwise pass baseline_std directly.
-  If neither is available, ask the user for a baseline_std estimate.
-- For binary: pass baseline_rate. If the dataset has the relevant
-  binary column, you may compute and mention the rate; otherwise ask.
-- mde: must come from the user. If unspecified, ask: "What's the
-  smallest effect that would matter to the business?"
+- metric_type: infer from context.
+- solve_for: "n" for sample size, "mde" for detectable effect, "power"
+  for adequacy of a plan.
+- For continuous: pass baseline_column if a relevant pre-period/historical
+  column exists; otherwise pass baseline_std directly; otherwise ask.
+- For binary: pass baseline_rate.
+- mde: must come from the user. If unspecified, ask: "What's the smallest
+  effect that would matter to the business?"
 
-Quote the verdict faithfully. In your summary:
-- State the answer clearly (e.g. "You need ~5,700 users per arm").
-- Briefly explain what it means for the user's plan.
-- If n is impractically large, suggest alternatives: longer duration,
-  larger MDE, or CUPED if pre-period data is available.
+Quote the verdict faithfully. State the answer clearly and briefly
+explain what it means for the plan. If n is impractically large, suggest
+alternatives: longer duration, larger MDE, or CUPED if pre-period data
+is available.
 
 ==================== HARD RULES ====================
 - Never compute or re-derive any statistic from raw inputs.
@@ -248,7 +257,7 @@ Dataset columns: {columns}
 Column dtypes: {dtypes}
 """
 
-def answer_question(df: pd.DataFrame, question: str, max_hops: int = 6) -> dict:
+def answer_question(df: pd.DataFrame, question: str, max_hops: int = 8) -> dict:
     """Run a multi-turn function-calling loop until Claude gives a final answer."""
     system = SYSTEM_PROMPT.format(
         columns=list(df.columns),
